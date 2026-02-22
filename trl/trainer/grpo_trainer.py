@@ -132,6 +132,26 @@ class GRPOTrainer(BaseTrainer):
     paper [DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language
     Models](https://huggingface.co/papers/2402.03300).
 
+    AV-GRPO (Adaptive Variance-aware GRPO) is available by setting ``loss_type="avgrpo"`` in :class:`GRPOConfig`.
+    It applies five targeted fixes over standard GRPO:
+
+    * ① Cross-step EMA variance tracking (``avgrpo_alpha``)
+    * ② Per-prompt adaptive clipping threshold ε_p(t) (``avgrpo_sigma_ref``, ``avgrpo_delta``)
+    * ③ Mean-only advantage normalisation (no σ division)
+    * ④ Q4 wrong-direction gradient dampening
+    * ⑤ Symmetric Q2 wrong-direction dampening
+
+    The extra hyperparameters can be passed via ``GRPOConfig`` using ``getattr``-style attribute access:
+
+    .. code-block:: python
+
+        args = GRPOConfig(
+            loss_type="avgrpo",
+            avgrpo_alpha=0.05,        # EMA rate  (≈ 20-step memory window)
+            avgrpo_sigma_ref=0.5,     # Reference σ for ε scaling
+            avgrpo_delta=1e-3,        # Denominator stability offset
+        )
+
     Example:
 
     ```python
@@ -552,6 +572,32 @@ class GRPOTrainer(BaseTrainer):
                 "`importance_sampling_level` to 'token'."
             )
 
+        # ── AV-GRPO ──────────────────────────────────────────────────────────────
+        # Activated when loss_type == "avgrpo". Implements five surgical fixes over
+        # standard GRPO without adding any extra model copies or significant overhead.
+        #
+        #   ① σ̂_p(t) = (1-α)·σ̂_p(t-1) + α·σ_p(t)   cross-step EMA variance
+        #   ② ε_p(t) = ε₀·σ_ref / (σ̂_p(t) + δ)       adaptive clipping threshold
+        #   ③ A_i   = r_i − μ                           mean-only advantage
+        #   ④ w_p   = ε_p(t)/ε₀ ∈ (0,1]               Q4 dampening weight
+        #   ⑤                                           symmetric Q2 dampening
+        #
+        if self.loss_type == "avgrpo" and self.use_liger_kernel:
+            raise ValueError(
+                "AV-GRPO (loss_type='avgrpo') is not compatible with use_liger_kernel=True. "
+                "Please set use_liger_kernel=False."
+            )
+        # EMA rate α — memory window ≈ 1/α steps (default: 0.05 → ~20 steps)
+        self.avgrpo_alpha: float = getattr(args, "avgrpo_alpha", 0.05)
+        # Reference σ used to anchor the ε scaling (default: 0.5)
+        self.avgrpo_sigma_ref: float = getattr(args, "avgrpo_sigma_ref", 0.5)
+        # Denominator stability offset δ to prevent division by zero (default: 1e-3)
+        self.avgrpo_delta: float = getattr(args, "avgrpo_delta", 1e-3)
+        # Per-prompt running EMA of reward std. Keyed by str(prompt)[:512].
+        # Lazily initialised to avgrpo_sigma_ref on first access.
+        self._avgrpo_sigma_ema: dict[str, float] = {}
+        # ─────────────────────────────────────────────────────────────────────────
+
         # Datasets
         self.shuffle_dataset = args.shuffle_dataset
 
@@ -602,7 +648,7 @@ class GRPOTrainer(BaseTrainer):
             optimizers=optimizers,
             # In Trainer, `training_step` scales the loss by `gradient_accumulation_steps` only if `compute_loss_func`
             # is None. For DAPO, loss scaling instead depends on the total number of completions tokens across the
-            # global accumulated batch. To control scaling ourselves, we must disable Trainer’s built-in scaling. The
+            # global accumulated batch. To control scaling ourselves, we must disable Trainer's built-in scaling. The
             # simplest (though a bit hacky) way is to set `compute_loss_func` to any non-None value, which bypasses
             # that behavior without rewriting `training_step`.
             compute_loss_func="non-None value to disable scaling",
@@ -1846,6 +1892,68 @@ class GRPOTrainer(BaseTrainer):
                 "'sum_then_normalize' or 'normalize_then_sum'."
             )
 
+        # ── AV-GRPO ①②③: Override advantages; compute per-prompt EMA σ̂ and ε_p(t) ──
+        # This block runs after either aggregation path above and replaces the std-normalised
+        # advantages with mean-only ones. It also populates `per_prompt_eps_local`, a tensor
+        # of per-sample adaptive clipping thresholds that is forwarded to _compute_loss.
+        #
+        # Layout of `rewards` after gather: (P_global × G,) where P_global is the total
+        # number of unique prompts across all ranks and G = num_generations.
+        #   Index mapping:  global unique-prompt index gi  →  reward rows [gi*G, (gi+1)*G)
+        #   Local unique prompts: indices [local_start, local_start + num_unique_local)
+        if self.loss_type == "avgrpo":
+            # ③ Mean-only advantage — magnitude preserved; no σ division
+            mean_grouped_rewards_av = (
+                rewards.view(-1, num_generations).mean(dim=1).repeat_interleave(num_generations, dim=0)
+            )
+            advantages = rewards - mean_grouped_rewards_av                 # (P_global × G,)
+
+            # ①② Cross-step EMA σ̂_p(t) and adaptive ε_p(t) — computed for local prompts only.
+            #     Non-local slots will be sliced away by process_slice below, so we only need
+            #     local values in per_prompt_eps_local.
+            rewards_grouped = rewards.view(-1, num_generations)            # (P_global, G)
+            per_prompt_sigma_global = rewards_grouped.std(dim=1)           # (P_global,)
+
+            num_unique_local = len(prompts) // num_generations             # unique prompts on this rank
+            local_start = self.accelerator.process_index * num_unique_local
+
+            per_prompt_eps_values: list[float] = []
+            for li in range(num_unique_local):
+                gi = local_start + li
+                # Identify the prompt by its text (first of G occurrences in local batch)
+                key = str(prompts[li * num_generations])[:512]
+
+                # Lazy-initialise EMA to sigma_ref
+                if key not in self._avgrpo_sigma_ema:
+                    self._avgrpo_sigma_ema[key] = self.avgrpo_sigma_ref
+
+                # ① EMA update: σ̂_p(t) = (1-α)·σ̂_p(t-1) + α·σ_p(t)
+                sigma_curr = per_prompt_sigma_global[gi].item()
+                self._avgrpo_sigma_ema[key] = (
+                    (1.0 - self.avgrpo_alpha) * self._avgrpo_sigma_ema[key]
+                    + self.avgrpo_alpha * sigma_curr
+                )
+
+                # ② Adaptive threshold: ε_p(t) = ε₀·σ_ref / (σ̂_p(t) + δ)
+                #    Capped at 4×ε₀ to prevent extreme values when σ̂ → 0 (e.g. all-same reward)
+                sigma_hat = self._avgrpo_sigma_ema[key]
+                eps_p = self.epsilon_low * self.avgrpo_sigma_ref / (sigma_hat + self.avgrpo_delta)
+                per_prompt_eps_values.append(min(eps_p, 4.0 * self.epsilon_low))
+
+            # Expand: one ε per unique prompt → one ε per completion sample
+            per_prompt_eps_local = torch.tensor(
+                per_prompt_eps_values, dtype=torch.float32, device=device
+            ).repeat_interleave(num_generations)                           # (len(prompts),)
+
+            # Recompute is_std_zero for logging from local instantaneous sigma
+            local_sigma = per_prompt_sigma_global[local_start : local_start + num_unique_local]
+            is_std_zero = torch.isclose(local_sigma, torch.zeros_like(local_sigma))
+            is_std_zero = is_std_zero.repeat_interleave(num_generations)
+
+            # Generation-time EMA epsilon diagnostic (logged once per generation batch)
+            self._metrics[mode]["avgrpo/mean_epsilon_gen"].append(per_prompt_eps_local.mean().item())
+        # ─────────────────────────────────────────────────────────────────────────────────
+
         # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
@@ -1941,6 +2049,10 @@ class GRPOTrainer(BaseTrainer):
             output["num_images"] = num_images
         if tool_mask is not None:
             output["tool_mask"] = tool_mask
+        # ── AV-GRPO: attach per-sample adaptive ε for use in _compute_loss ──────────
+        if self.loss_type == "avgrpo":
+            output["per_prompt_epsilon"] = per_prompt_eps_local
+        # ─────────────────────────────────────────────────────────────────────────────
         return output
 
     def compute_liger_loss(self, unwrapped_model, inputs):
@@ -2123,6 +2235,54 @@ class GRPOTrainer(BaseTrainer):
             temperatures = torch.where(advantages > 0, self.args.sapo_temperature_pos, self.args.sapo_temperature_neg)
             soft_coef_1 = torch.sigmoid(temperatures * (coef_1 - 1)) * 4 / temperatures
             per_token_loss = -soft_coef_1 * advantages
+
+        # ── AV-GRPO ②③④⑤ loss computation ──────────────────────────────────────────
+        elif self.loss_type == "avgrpo":
+            # ② Retrieve per-prompt adaptive clipping threshold ε_p(t).
+            #    Falls back to the global ε₀ if the tensor was not forwarded (e.g. eval with buffered inputs).
+            per_prompt_eps: torch.Tensor = inputs.get("per_prompt_epsilon")
+            if per_prompt_eps is None:
+                per_prompt_eps = advantages.new_full((advantages.shape[0], 1), self.epsilon_low)
+            else:
+                if per_prompt_eps.dim() == 1:
+                    per_prompt_eps = per_prompt_eps.unsqueeze(1)   # (B, 1) — broadcasts over token dim
+
+            # ④ Dampening weight w_p = ε_p(t) / ε₀ ∈ (0, 1].
+            #    High σ̂_p → small ε_p → small w_p → strong dampening  (volatile prompt)
+            #    Low  σ̂_p → large ε_p (capped) → w_p = 1 → no dampening (stable prompt)
+            w_p = (per_prompt_eps / (self.epsilon_low + 1e-8)).clamp(min=0.0, max=1.0)  # (B, 1)
+
+            # ④ Q4: ratio > 1+ε_p  AND  A < 0
+            #        Wrong direction, model grows more confident in a penalised token.
+            #        In standard GRPO this gradient is unbounded (the structural gap).
+            is_q4 = (coef_1 > 1.0 + per_prompt_eps) & (advantages < 0.0)   # (B, T)
+
+            # ⑤ Q2: ratio < 1-ε_p  AND  A > 0
+            #        Wrong direction, model shrinks confidence in a reinforced token.
+            #        Bounded by r < 1, so less catastrophic, but still a bias source.
+            is_q2 = (coef_1 < 1.0 - per_prompt_eps) & (advantages > 0.0)   # (B, T)
+
+            is_wrong_direction = is_q4 | is_q2
+
+            # Selective dampening: w_p for wrong-direction tokens, 1.0 everywhere else.
+            # Q1 and Q3 will still produce zero gradient after the clip below, so their
+            # dampening factor is irrelevant — leaving them at 1.0 is correct.
+            token_dampening = torch.where(
+                is_wrong_direction,
+                w_p.expand_as(coef_1),
+                torch.ones_like(coef_1),
+            )                                                                # (B, T)
+
+            dampened_advantages = advantages * token_dampening              # (B, T)
+
+            # ② Per-prompt adaptive clip: clip(ρ, 1-ε_p, 1+ε_p)
+            coef_2 = torch.min(1.0 + per_prompt_eps, torch.max(1.0 - per_prompt_eps, coef_1))
+
+            per_token_loss1 = coef_1 * dampened_advantages
+            per_token_loss2 = coef_2 * dampened_advantages
+            per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        # ─────────────────────────────────────────────────────────────────────────────
+
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
@@ -2159,6 +2319,12 @@ class GRPOTrainer(BaseTrainer):
             loss = (per_token_loss * mask.sum(1, keepdim=True)).mean()
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
             loss = loss / normalizer
+        # ── AV-GRPO: sequence-mean normalisation (same convention as standard GRPO) ──
+        elif self.loss_type == "avgrpo":
+            loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
+            normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0
+            loss = loss / normalizer
+        # ─────────────────────────────────────────────────────────────────────────────
         else:
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
@@ -2201,6 +2367,46 @@ class GRPOTrainer(BaseTrainer):
             cispo_clip_ratio = masked_batch_mean(is_cispo_clipped.float())
             gathered_cispo_clip_ratio = self.accelerator.gather(cispo_clip_ratio)
             self._metrics[mode]["cispo_clip_ratio"].append(gathered_cispo_clip_ratio.nanmean().item())
+
+        # ── AV-GRPO per-step diagnostics ─────────────────────────────────────────────
+        elif self.loss_type == "avgrpo":
+            # Clip ratio using per-prompt adaptive ε (mirrors GRPO clip_ratio logic)
+            is_low_clipped_av = (coef_1 < 1.0 - per_prompt_eps) & (advantages < 0.0)
+            is_high_clipped_av = (coef_1 > 1.0 + per_prompt_eps) & (advantages > 0.0)
+            is_region_clipped_av = is_low_clipped_av | is_high_clipped_av
+
+            low_clip_av = masked_batch_mean(is_low_clipped_av.float())
+            high_clip_av = masked_batch_mean(is_high_clipped_av.float())
+            clip_ratio_av = masked_batch_mean(is_region_clipped_av.float())
+
+            gathered_low_clip_av = self.accelerator.gather(low_clip_av)
+            self._metrics[mode]["clip_ratio/low_mean"].append(gathered_low_clip_av.nanmean().item())
+            self._metrics[mode]["clip_ratio/low_min"].append(nanmin(gathered_low_clip_av).item())
+            gathered_high_clip_av = self.accelerator.gather(high_clip_av)
+            self._metrics[mode]["clip_ratio/high_mean"].append(gathered_high_clip_av.nanmean().item())
+            self._metrics[mode]["clip_ratio/high_max"].append(nanmax(gathered_high_clip_av).item())
+            gathered_clip_ratio_av = self.accelerator.gather(clip_ratio_av)
+            self._metrics[mode]["clip_ratio/region_mean"].append(gathered_clip_ratio_av.nanmean().item())
+
+            # AV-GRPO-specific: Q4 fraction, Q2 fraction, mean dampening, mean ε_p
+            q4_frac = masked_batch_mean(is_q4.float())
+            q2_frac = masked_batch_mean(is_q2.float())
+            mean_damp = masked_batch_mean(token_dampening)
+            mean_eps_p = masked_batch_mean(per_prompt_eps.expand_as(mask.float()))
+
+            self._metrics[mode]["avgrpo/q4_fraction"].append(
+                self.accelerator.gather(q4_frac).nanmean().item()
+            )
+            self._metrics[mode]["avgrpo/q2_fraction"].append(
+                self.accelerator.gather(q2_frac).nanmean().item()
+            )
+            self._metrics[mode]["avgrpo/mean_dampening"].append(
+                self.accelerator.gather(mean_damp).nanmean().item()
+            )
+            self._metrics[mode]["avgrpo/mean_epsilon_loss"].append(
+                self.accelerator.gather(mean_eps_p).nanmean().item()
+            )
+        # ─────────────────────────────────────────────────────────────────────────────
 
         return loss
 
