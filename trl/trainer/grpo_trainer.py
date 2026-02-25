@@ -1938,7 +1938,8 @@ class GRPOTrainer(BaseTrainer):
                 #    Capped at 4×ε₀ to prevent extreme values when σ̂ → 0 (e.g. all-same reward)
                 sigma_hat = self._avgrpo_sigma_ema[key]
                 eps_p = self.epsilon_low * self.avgrpo_sigma_ref / (sigma_hat + self.avgrpo_delta)
-                per_prompt_eps_values.append(min(eps_p, 4.0 * self.epsilon_low))
+                # per_prompt_eps_values.append(min(eps_p, 4.0 * self.epsilon_low))
+                per_prompt_eps_values.append(eps_p)
 
             # Expand: one ε per unique prompt → one ε per completion sample
             per_prompt_eps_local = torch.tensor(
